@@ -31,6 +31,17 @@ ROOT = Path(__file__).resolve().parent
 PDF_DIR = ROOT / "pdf"
 OUT_DIR = ROOT / "processed"
 
+# Load .env (if present) before any marker/surya import so settings like
+# MODEL_CACHE_DIR and ANTHROPIC_API_KEY are picked up. MODEL_CACHE_DIR matters
+# on hosts where the home partition is full: point it at a roomier disk so the
+# ~3 GB of model weights don't fail to download with "No space left on device".
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
 # Image references in Marker markdown look like ![alt](name.jpeg) or with a path.
 _IMG_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
 
