@@ -4,20 +4,18 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "marker-pdf>=1.10.2",
-    # Listed directly so the CPU-only source override below actually binds —
+    # Listed directly so the CUDA source override below actually binds —
     # uv only applies [tool.uv.sources] to direct dependencies, not transitive.
     "torch>=2.0",
     "torchvision",
 ]
 
-# Pull torch/torchvision from the CPU-only wheel index. This machine has no
-# NVIDIA GPU, so we skip the ~3-5 GB of nvidia-* CUDA packages entirely.
-# To run on a GPU host later, remove this block and re-run `uv sync`.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
-torchvision = [{ index = "pytorch-cpu" }]
