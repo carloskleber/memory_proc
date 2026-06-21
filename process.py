@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -26,6 +27,31 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _configure_cpu_threads() -> None:
+    """Cap BLAS/OpenMP threads so pdftext workers and PyTorch don't oversubscribe."""
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # Surya spawns nested pools unless this is set (Marker's convert CLI does the same).
+    os.environ.setdefault("IN_STREAMLIT", "true")
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+    os.environ.setdefault("GLOG_minloglevel", "2")
+    # Reduces VRAM fragmentation on long batch runs.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    n = os.cpu_count() or 4
+    if sys.platform == "win32":
+        # Windows WDDM + heavy GPU load: keep CPU threads low to avoid watchdog BSODs.
+        threads = str(max(2, min(4, n // 6)))
+    else:
+        threads = str(max(2, n // 4))
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, threads)
+    os.environ.setdefault("MKL_DYNAMIC", "FALSE")
+    os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+
+
+_configure_cpu_threads()
 
 ROOT = Path(__file__).resolve().parent
 PDF_DIR = ROOT / "pdf"
@@ -44,6 +70,20 @@ except ImportError:
 
 # Image references in Marker markdown look like ![alt](name.jpeg) or with a path.
 _IMG_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
+
+# Marker leaks RSS when a PdfConverter is reused across documents; recycle it often.
+RECYCLE_CONVERTER_EVERY = 1
+
+# Shorter GPU kernels + less CPU contention reduce CLOCK_WATCHDOG_TIMEOUT / TDR on
+# Windows, where the display driver shares the GPU with CUDA (WDDM).
+_WINDOWS_CUDA_BATCH: dict[str, int] = {
+    "recognition_batch_size": 12,
+    "layout_batch_size": 4,
+    "detection_batch_size": 4,
+    "ocr_error_batch_size": 4,
+    "table_rec_batch_size": 4,
+    "equation_batch_size": 4,
+}
 
 
 def sha256(path: Path) -> str:
@@ -73,6 +113,73 @@ def detect_device() -> str:
     return "cpu"
 
 
+def _pdftext_workers() -> int:
+    override = os.environ.get("MARKER_PDFTEXT_WORKERS")
+    if override is not None:
+        return max(1, int(override))
+    if sys.platform == "win32":
+        return 2
+    try:
+        import psutil
+
+        return max(1, psutil.cpu_count(logical=False) or 1)
+    except ImportError:
+        return max(1, (os.cpu_count() or 4) // 2)
+
+
+def _configure_torch_threads() -> None:
+    try:
+        import torch
+
+        n = os.cpu_count() or 4
+        threads = max(2, min(4, n // 6)) if sys.platform == "win32" else max(2, n // 4)
+        torch.set_num_threads(threads)
+    except Exception:
+        pass
+
+
+def release_gpu_memory(*, cooldown: bool = False, device: str = "") -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if cooldown and sys.platform == "win32" and device == "cuda":
+        sec = float(os.environ.get("MARKER_GPU_COOLDOWN_SEC", "3"))
+        if sec > 0:
+            time.sleep(sec)
+
+
+def marker_performance_config() -> dict:
+    """GPU batch sizes and CPU extraction workers (mirrors Marker's convert CLI)."""
+    perf: dict = {"disable_tqdm": True, "pdftext_workers": _pdftext_workers()}
+
+    if sys.platform == "win32":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                perf.update(_WINDOWS_CUDA_BATCH)
+        except Exception:
+            pass
+        return perf
+
+    try:
+        from marker.utils.batch import get_batch_sizes_worker_counts
+        from marker.utils.gpu import GPUManager
+
+        with GPUManager(0) as gpu_manager:
+            batch_sizes, _ = get_batch_sizes_worker_counts(gpu_manager, 7)
+        perf.update(batch_sizes)
+    except Exception:
+        pass
+    return perf
+
+
 def already_done(out_paper_dir: Path, pdf_hash: str) -> bool:
     meta = out_paper_dir / "meta.json"
     if not meta.exists():
@@ -84,20 +191,20 @@ def already_done(out_paper_dir: Path, pdf_hash: str) -> bool:
     return data.get("sha256") == pdf_hash
 
 
-def build_converter(use_llm: bool):
-    """Create a Marker PdfConverter, loading the model artifacts once."""
+def build_converter(use_llm: bool, artifact_dict: dict, perf_config: dict | None = None):
+    """Create a Marker PdfConverter using a shared model artifact dict."""
     from marker.config.parser import ConfigParser
     from marker.converters.pdf import PdfConverter
-    from marker.models import create_model_dict
 
     config: dict = {"output_format": "markdown"}
+    config.update(perf_config if perf_config is not None else marker_performance_config())
     if use_llm:
         config["use_llm"] = True
 
     parser = ConfigParser(config)
     return PdfConverter(
         config=parser.generate_config_dict(),
-        artifact_dict=create_model_dict(),
+        artifact_dict=artifact_dict,
         processor_list=parser.get_processors(),
         renderer=parser.get_renderer(),
         llm_service=parser.get_llm_service() if use_llm else None,
@@ -156,7 +263,11 @@ def convert_one(pdf: Path, converter, use_llm: bool, force: bool, device: str) -
     out_paper_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     rendered = converter(str(pdf))
-    n_figs = save_result(rendered, out_paper_dir, stem)
+    try:
+        n_figs = save_result(rendered, out_paper_dir, stem)
+    finally:
+        del rendered
+        release_gpu_memory()
     duration = round(time.time() - started, 1)
 
     meta = {
@@ -206,19 +317,50 @@ def main() -> None:
     print(f"Device: {device}")
     if device == "cpu":
         print("  warning: CPU-only — expect minutes per paper. Consider a GPU host or an overnight batch.")
+    if sys.platform == "win32" and device == "cuda":
+        print(
+            "  Windows CUDA: conservative batch sizes, 2 pdftext workers, and a short "
+            "GPU cooldown between PDFs to reduce CLOCK_WATCHDOG_TIMEOUT / driver TDR risk."
+        )
     if args.llm and not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("error: --llm set but ANTHROPIC_API_KEY is not in the environment (see .env.example).")
 
-    print(f"Loading Marker models...")
-    converter = build_converter(args.llm)
+    _configure_torch_threads()
+
+    from marker.models import create_model_dict
+
+    print("Loading Marker models...")
+    perf_config = marker_performance_config()
+    artifact_dict = create_model_dict()
+    converter = None
+    conversions_since_recycle = 0
 
     print(f"Processing {len(pdfs)} PDF(s):")
     stats = {"done": 0, "skipped": 0}
     for pdf in pdfs:
         try:
-            stats[convert_one(pdf, converter, args.llm, args.force, device)] += 1
+            if converter is None:
+                converter = build_converter(args.llm, artifact_dict, perf_config)
+            result = convert_one(pdf, converter, args.llm, args.force, device)
+            stats[result] += 1
+            if result == "done":
+                conversions_since_recycle += 1
+                if conversions_since_recycle >= RECYCLE_CONVERTER_EVERY:
+                    del converter
+                    converter = None
+                    conversions_since_recycle = 0
+                    release_gpu_memory(cooldown=True, device=device)
         except Exception as exc:  # keep the batch going if one paper fails
             print(f"  FAILED: {pdf.name}: {exc}")
+            if converter is not None:
+                del converter
+                converter = None
+                conversions_since_recycle = 0
+                release_gpu_memory()
+
+    if converter is not None:
+        del converter
+    release_gpu_memory()
 
     print(f"\nFinished: {stats['done']} converted, {stats['skipped']} skipped.")
 

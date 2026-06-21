@@ -4,3 +4,4 @@ __pycache__/
 processed/
 *.pyc
 .history/
+pdf/
