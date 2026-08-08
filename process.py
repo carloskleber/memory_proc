@@ -20,6 +20,7 @@ Usage:
     uv run process.py --tier 1        # start from conservative settings
     uv run process.py --no-isolate    # single process (old behaviour)
     uv run process.py --no-equations  # skip LaTeX OCR (helps on 6-8 GiB GPUs)
+    uv run process.py -v              # extra diagnostics (GPU mem, tracebacks)
 """
 
 from __future__ import annotations
@@ -34,8 +35,17 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+VERBOSE = False
+
+
+def log(msg: str, *, verbose_only: bool = False) -> None:
+    if verbose_only and not VERBOSE:
+        return
+    print(msg, flush=True)
 
 
 def _configure_cpu_threads() -> None:
@@ -210,6 +220,21 @@ def gpu_vram_gb() -> float:
         return 0.0
 
 
+def gpu_memory_snapshot() -> str | None:
+    """One-line allocated/reserved VRAM summary for -v diagnostics, or None off-CUDA."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        idx = torch.cuda.current_device()
+        alloc = torch.cuda.memory_allocated(idx) / (1 << 20)
+        reserved = torch.cuda.memory_reserved(idx) / (1 << 20)
+        return f"GPU mem: {alloc:.0f} MiB allocated, {reserved:.0f} MiB reserved"
+    except Exception as exc:
+        return f"GPU mem: unavailable ({exc})"
+
+
 def _pdftext_workers() -> int:
     override = os.environ.get("MARKER_PDFTEXT_WORKERS")
     if override is not None:
@@ -243,11 +268,15 @@ def release_gpu_memory(*, cooldown: bool = False, device: str = "") -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-    except Exception:
-        pass
+            snap = gpu_memory_snapshot()
+            if snap:
+                log(f"  released GPU memory — {snap}", verbose_only=True)
+    except Exception as exc:
+        log(f"  GPU cleanup failed: {exc}", verbose_only=True)
     if cooldown and sys.platform == "win32" and device == "cuda":
         sec = float(os.environ.get("MARKER_GPU_COOLDOWN_SEC", "3"))
         if sec > 0:
+            log(f"  GPU cooldown: sleeping {sec}s (MARKER_GPU_COOLDOWN_SEC)", verbose_only=True)
             time.sleep(sec)
 
 
@@ -380,10 +409,15 @@ def convert_one(
     stem = slugify(pdf.stem)
     out_paper_dir = OUT_DIR / stem
     pdf_hash = sha256(pdf)
+    log(f"    sha256: {pdf_hash[:16]}…", verbose_only=True)
 
     if not force and already_done(out_paper_dir, pdf_hash):
         print(f"  skip (already done): {pdf.name}")
         return "skipped"
+
+    snap = gpu_memory_snapshot()
+    if snap:
+        log(f"    {snap}", verbose_only=True)
 
     fresh_dir = not out_paper_dir.exists()
     out_paper_dir.mkdir(parents=True, exist_ok=True)
@@ -463,6 +497,8 @@ def worker_main(args) -> int:
         )
     except Exception as exc:
         print(f"  FAILED: {pdf.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if VERBOSE:
+            traceback.print_exc()
         return EXIT_GPU if _looks_like_gpu_error(exc) else EXIT_ERROR
     finally:
         del converter
@@ -491,6 +527,8 @@ def run_isolated(pdf: Path, tier: int, args, timeout: float) -> tuple[str, int]:
         cmd.append("--force")
     if args.no_equations:
         cmd.append("--no-equations")
+    if args.verbose:
+        cmd.append("-v")
 
     try:
         proc = subprocess.run(cmd, timeout=timeout if timeout > 0 else None)
@@ -594,6 +632,8 @@ def process_in_line(pdfs: list[Path], args, device: str) -> dict:
                 retryable = _looks_like_gpu_error(exc) and tier < max_tier
                 if not retryable:
                     print(f"  FAILED: {pdf.name}: {exc}")
+                    if VERBOSE:
+                        traceback.print_exc()
                     stats["failed"] += 1
                     failures.append(pdf.name)
                     break
@@ -610,10 +650,13 @@ def process_in_line(pdfs: list[Path], args, device: str) -> dict:
 
 
 def main() -> None:
+    global VERBOSE
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--file", help="convert a single PDF (name in pdf/ or a path)")
     ap.add_argument("--force", action="store_true", help="reconvert even if already done")
     ap.add_argument("--llm", action="store_true", help="enable Marker's LLM cleanup pass (needs ANTHROPIC_API_KEY)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="extra diagnostics (GPU memory, tracebacks, hashes)")
     ap.add_argument(
         "--tier",
         type=int,
@@ -640,6 +683,7 @@ def main() -> None:
     )
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    VERBOSE = args.verbose
 
     PDF_DIR.mkdir(exist_ok=True)
     OUT_DIR.mkdir(exist_ok=True)
@@ -656,6 +700,14 @@ def main() -> None:
 
     device = detect_device()
     print(f"Device: {device}")
+    try:
+        import torch
+
+        log(f"  PyTorch {torch.__version__}", verbose_only=True)
+        if device == "cuda":
+            log(f"  CUDA driver/runtime: {torch.version.cuda}", verbose_only=True)
+    except Exception:
+        pass
     if device == "cuda":
         vram = gpu_vram_gb()
         print(f"  VRAM: {vram:.1f} GB")
