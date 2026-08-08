@@ -38,6 +38,8 @@ uv run process.py                 # convert every new PDF in pdf/
 uv run process.py --file NAME     # convert one PDF (name in pdf/ or a path)
 uv run process.py --force         # reconvert even if already processed
 uv run process.py --llm           # optional LLM cleanup pass for equations/tables
+uv run process.py --tier 1        # start already-conservative (small/flaky GPU)
+uv run process.py --no-isolate    # convert in one process (old behaviour)
 ```
 
 Re-runs are cheap: a paper is skipped when its SHA-256 matches the hash in its
@@ -53,6 +55,49 @@ cp .env.example .env            # then fill in ANTHROPIC_API_KEY
 export ANTHROPIC_API_KEY=sk-ant-...
 uv run process.py --llm
 ```
+
+## Surviving CUDA aborts (small GPUs)
+
+A CUDA fault — out of memory, an illegal memory access, a driver reset/TDR — is
+not recoverable inside the process it happens in: the CUDA context is dead, so
+every later paper in the batch would fail too. The processor therefore converts
+**each PDF in its own child process**. A CUDA abort kills only that child; the
+parent reports it and moves on to the next paper.
+
+The offending paper is then retried on a ladder of progressively more
+conservative settings, and **the next paper starts again at tier 0**:
+
+| Tier | Settings |
+|------|----------|
+| 0 | auto: batch sizes chosen from the detected VRAM |
+| 1 | small batches (recognition 4, everything else 1), 1 pdftext worker |
+| 2 | minimum batches (all 1) plus lower render DPI (192→144 / 96→72) |
+
+Retries are skipped when the failure is clearly the document's fault (a corrupt
+PDF), since smaller batches cannot fix that. A child that hangs — a wedged
+driver never returns — is killed after `--timeout` seconds (30 min by default on
+CUDA) and retried one tier down.
+
+```bash
+uv run process.py --tier 1      # skip tier 0 if the card aborts constantly
+uv run process.py --no-retry    # one attempt per paper
+uv run process.py --timeout 600 # tighter stuck-child deadline
+uv run process.py --no-isolate  # single process: faster, but one abort ends the run
+```
+
+The batch exits non-zero and lists the papers it could not convert; everything
+else is written normally, and a failed paper leaves no half-written folder
+behind, so a later re-run simply retries it.
+
+### Why small cards abort in the first place
+
+Surya's CUDA batch defaults (recognition 256, detection 36, layout 32) assume an
+8 GB+ card, and Marker's auto-tuner only overrides them when the GPU is big
+enough for more than one worker — that is, it leaves the large defaults in place
+on exactly the small cards that cannot take them. So the processor pins explicit
+batch sizes by VRAM: under 4 GB (a 3 GB card) and 4–8 GB get their own profiles;
+8 GB+ keeps Marker's own tuning. This alone removes most aborts on a 3 GB GPU;
+the isolation and retry ladder above cover what is left.
 
 ## Hardware & GPU
 
