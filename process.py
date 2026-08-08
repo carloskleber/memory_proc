@@ -19,6 +19,7 @@ Usage:
     uv run process.py --llm           # enable Marker's LLM cleanup pass
     uv run process.py --tier 1        # start from conservative settings
     uv run process.py --no-isolate    # single process (old behaviour)
+    uv run process.py --no-equations  # skip LaTeX OCR (helps on 6-8 GiB GPUs)
 """
 
 from __future__ import annotations
@@ -159,6 +160,16 @@ _RETRY_TIERS: list[dict] = [
 ]
 MAX_TIER = len(_RETRY_TIERS) - 1
 
+# EquationProcessor runs Surya's LaTeX OCR over every math block and is the single
+# heaviest stage on VRAM; --no-equations drops it instead of just shrinking batches.
+_EQUATION_PROCESSORS = frozenset(
+    {
+        "marker.processors.equation.EquationProcessor",
+        "marker.processors.llm.llm_equation.LLMEquationProcessor",
+        "marker.processors.llm.llm_mathblock.LLMMathBlockProcessor",
+    }
+)
+
 
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -289,10 +300,17 @@ def already_done(out_paper_dir: Path, pdf_hash: str) -> bool:
     return data.get("sha256") == pdf_hash
 
 
-def build_converter(use_llm: bool, artifact_dict: dict, perf_config: dict | None = None):
+def build_converter(
+    use_llm: bool,
+    artifact_dict: dict,
+    perf_config: dict | None = None,
+    *,
+    no_equations: bool = False,
+):
     """Create a Marker PdfConverter using a shared model artifact dict."""
     from marker.config.parser import ConfigParser
     from marker.converters.pdf import PdfConverter
+    from marker.util import classes_to_strings
 
     config: dict = {"output_format": "markdown"}
     config.update(perf_config if perf_config is not None else marker_performance_config())
@@ -300,10 +318,17 @@ def build_converter(use_llm: bool, artifact_dict: dict, perf_config: dict | None
         config["use_llm"] = True
 
     parser = ConfigParser(config)
+    processor_list = parser.get_processors()
+    if no_equations:
+        processor_list = [
+            p
+            for p in classes_to_strings(list(PdfConverter.default_processors))
+            if p not in _EQUATION_PROCESSORS
+        ]
     return PdfConverter(
         config=parser.generate_config_dict(),
         artifact_dict=artifact_dict,
-        processor_list=parser.get_processors(),
+        processor_list=processor_list,
         renderer=parser.get_renderer(),
         llm_service=parser.get_llm_service() if use_llm else None,
     )
@@ -349,7 +374,9 @@ def save_result(rendered, out_paper_dir: Path, stem: str) -> int:
     return count
 
 
-def convert_one(pdf: Path, converter, use_llm: bool, force: bool, device: str) -> str:
+def convert_one(
+    pdf: Path, converter, use_llm: bool, force: bool, device: str, *, no_equations: bool = False
+) -> str:
     stem = slugify(pdf.stem)
     out_paper_dir = OUT_DIR / stem
     pdf_hash = sha256(pdf)
@@ -383,6 +410,7 @@ def convert_one(pdf: Path, converter, use_llm: bool, force: bool, device: str) -
         "figures": n_figs,
         "device": device,
         "use_llm": use_llm,
+        "no_equations": no_equations,
         "duration_sec": duration,
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -428,9 +456,11 @@ def worker_main(args) -> int:
 
     perf_config = marker_performance_config(args.tier)
     artifact_dict = create_model_dict()
-    converter = build_converter(args.llm, artifact_dict, perf_config)
+    converter = build_converter(args.llm, artifact_dict, perf_config, no_equations=args.no_equations)
     try:
-        result = convert_one(pdf, converter, args.llm, args.force, device)
+        result = convert_one(
+            pdf, converter, args.llm, args.force, device, no_equations=args.no_equations
+        )
     except Exception as exc:
         print(f"  FAILED: {pdf.name}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_GPU if _looks_like_gpu_error(exc) else EXIT_ERROR
@@ -459,6 +489,8 @@ def run_isolated(pdf: Path, tier: int, args, timeout: float) -> tuple[str, int]:
         cmd.append("--llm")
     if args.force:
         cmd.append("--force")
+    if args.no_equations:
+        cmd.append("--no-equations")
 
     try:
         proc = subprocess.run(cmd, timeout=timeout if timeout > 0 else None)
@@ -534,9 +566,16 @@ def process_in_line(pdfs: list[Path], args, device: str) -> dict:
         while True:
             try:
                 if converter is None or converter_tier != tier:
-                    converter = build_converter(args.llm, artifact_dict, marker_performance_config(tier))
+                    converter = build_converter(
+                        args.llm,
+                        artifact_dict,
+                        marker_performance_config(tier),
+                        no_equations=args.no_equations,
+                    )
                     converter_tier = tier
-                result = convert_one(pdf, converter, args.llm, args.force, device)
+                result = convert_one(
+                    pdf, converter, args.llm, args.force, device, no_equations=args.no_equations
+                )
                 stats[result] += 1
                 if result == "done":
                     conversions_since_recycle += 1
@@ -584,6 +623,11 @@ def main() -> None:
     )
     ap.add_argument("--no-retry", action="store_true", help="do not retry a failed PDF with smaller batches")
     ap.add_argument(
+        "--no-equations",
+        action="store_true",
+        help="skip EquationProcessor (no LaTeX OCR; much safer on 6-8 GiB GPUs)",
+    )
+    ap.add_argument(
         "--no-isolate",
         action="store_true",
         help="convert in this process instead of one child per PDF (a CUDA abort then ends the run)",
@@ -630,6 +674,8 @@ def main() -> None:
     isolate = not args.no_isolate
     if isolate:
         print("  isolation: one child process per PDF; a CUDA abort loses only that paper.")
+    if args.no_equations:
+        print("  EquationProcessor disabled (--no-equations): no LaTeX OCR on math blocks.")
 
     print(f"Processing {len(pdfs)} PDF(s):")
     stats = (process_isolated if isolate else process_in_line)(pdfs, args, device)
